@@ -1,9 +1,13 @@
-# AI Assistant System Architecture
+# AI Assistant System Architecture with Agentic Verification
 
-This project is a full-stack AI assistant application that combines retrieval-augmented generation (RAG) with tool calling capabilities. The system consists of two main components:
+This project is a full-stack AI assistant application that combines retrieval-augmented generation (RAG) with tool calling capabilities and agentic verification. The system consists of two main components:
 
 - **Frontend**: A Next.js application that handles user interaction, authentication, and real-time chat streaming
-- **Backend**: A FastAPI service that manages authentication, document processing, RAG retrieval, and AI model interactions
+- **Backend**: A FastAPI service that manages authentication, document processing, RAG retrieval, AI model interactions, and agentic verification loops
+
+## Week 16 Extension: Agentic Verification Feature
+
+This implementation extends the Week 15 assistant with cross-source verification capabilities, allowing the AI agent to evaluate whether information needs verification from multiple sources and decide whether to perform additional searches before responding.
 
 ## System Overview
 
@@ -17,7 +21,15 @@ flowchart LR
     API --> Redis["Redis\nRate Limiting"]
     API --> Qdrant["Qdrant Cloud"]
     API --> LLM["Hugging Face Router / vLLM"]
-    API --> External["External APIs\nWeather + Calculator"]
+    API --> External["External APIs\nWeather + Calculator + Search"]
+    API --> Skills["Skill Manager\nProgressive Disclosure"]
+    API --> Verification["Verification Agent\nAgentic Loop"]
+    
+    Verification -->|"Decision Loop"| Eval{"Verify?"}
+    Eval -->|"Yes"| Search[Web Search]
+    Eval -->|"No"| Response[Generate Response]
+    Search --> Compare[Compare Sources]
+    Compare --> Response
 ```
 
 **Key Design Decisions:**
@@ -47,10 +59,15 @@ flowchart LR
     Chat --> Service["Chat service"]
     Service --> DB
     Service --> Retriever["Retriever"]
-    Service --> Agent["Agent"]
+    Service --> Agent["Verification Agent"]
     Retriever --> Qdrant
     Agent --> LLM["LLM client"]
     Agent --> Tools["Tool registry"]
+    Agent --> Skills["Skill Manager"]
+    Tools --> WebSearch["Web Search"]
+    Tools --> Calculator["Calculator"]
+    Tools --> Weather["Weather"]
+    Tools --> Time["Time"]
 ```
 
 **Component Responsibilities:**
@@ -60,8 +77,9 @@ flowchart LR
 - **Chat Service**: Orchestrate the complete chat flow including history loading, RAG retrieval, and AI generation
 - **Ingestion Service**: Process uploaded documents (validation, text extraction, chunking, vectorization)
 - **Retriever**: Search vector database for relevant document chunks based on user queries
-- **Assistant Agent**: Execute the AI model with tool-calling capabilities and structured output
-- **Tool Registry**: Manage available tools (calculator, weather, time) and validate their execution
+- **Verification Agent**: Enhanced agent with cross-source verification capabilities, progressive disclosure through Skills, and agentic decision-making loops
+- **Skill Manager**: Manages progressive disclosure of skill instructions, loading concise summaries initially and full instructions when relevant
+- **Tool Registry**: Manage available tools (calculator, weather, time, web search) and validate their execution
 - **LLM Client**: Interface with language model providers (Hugging Face or local vLLM)
 - **Databases**: PostgreSQL for persistent data, Qdrant for vector storage, Redis for rate limiting
 
@@ -219,6 +237,29 @@ flowchart TD
     Stream --> Metadata["Extract metadata"]
     Metadata --> Validate["Validate citations and confidence"]
     Validate --> Response["Save and return response"]
+```
+
+**Enhanced Agentic Verification Flow:**
+
+```mermaid
+flowchart TD
+    Input["Question + Skills Context"] --> InitialAgent["Initial Agent Processing"]
+    InitialAgent --> ToolLoop["Tool Planning Loop"]
+    ToolLoop --> Decision1{"Tools Needed?"}
+    Decision1 -->|"Yes"| ExecuteTools["Execute Tools"]
+    ExecuteTools --> ToolLoop
+    Decision1 -->|"No"| InitialAnswer["Generate Initial Answer"]
+    InitialAnswer --> VerifyEval{"Verification Needed?"}
+    VerifyEval -->|"Yes"| VerifyLoop["Verification Loop"]
+    VerifyLoop --> SearchQueries["Generate Search Queries"]
+    SearchQueries --> WebSearch["Execute Web Searches"]
+    WebSearch --> CompareResults["Compare Results"]
+    CompareResults --> Decision2{"More Verification?"}
+    Decision2 -->|"Yes"| VerifyLoop
+    Decision2 -->|"No"| UpdateAnswer["Update Answer with Verification"]
+    UpdateAnswer --> FinalResponse["Final Response"]
+    VerifyEval -->|"No"| FinalResponse
+    VerifyLoop -. "Max 3 rounds" .-> FinalResponse
 ```
 
 **Agent Behavior:**
@@ -397,3 +438,63 @@ flowchart LR
 - Schema changes are handled through Alembic migrations, not application startup
 - Expired documents are automatically removed from both PostgreSQL and Qdrant
 - Cascade deletion ensures data consistency when users are removed
+
+---
+
+## Week 16 Assignment Implementation
+
+### Context Engineering Technique
+
+**Technique Applied:** Progressive Disclosure through Skills
+
+**Application Location:** The SkillManager class in `backend/app/skills/skill_manager.py` is integrated into the VerificationAssistantAgent's message building process. When the agent builds its initial messages, it calls `self._skill_manager.get_context_augmentation(question)` which loads concise skill summaries initially and only provides full instructions when the model determines a skill is relevant based on trigger keywords.
+
+**Problem Solved:** Without progressive disclosure, the full instructions for all possible skills (verification, research, comparison) would be loaded into every conversation, causing context saturation and increased token costs. The progressive disclosure technique reduces initial context size by loading only 1-2 sentence summaries for each skill, and expands to full instructions only when the agent's query contains trigger keywords indicating that skill is needed. This keeps the context focused while still providing detailed guidance when relevant.
+
+### Agentic Pattern
+
+**Pattern Choice:** Single-Agent Loop
+
+**Rationale:** I chose a single-agent design rather than a multi-agent system for the following reasons:
+
+1. **Task Suitability:** The cross-source verification task is fundamentally sequential - the agent must first generate an answer, then evaluate if it needs verification, then perform searches, then update the answer. There's no inherent parallelization benefit to splitting this across multiple agents.
+
+2. **Context Management:** The verification process requires maintaining the original question, initial answer, and verification results in a coherent conversation flow. A single agent naturally maintains this context without the complexity of inter-agent communication protocols.
+
+3. **Avoiding Overhead:** Multi-agent systems introduce coordination overhead (message passing, state synchronization, conflict resolution) that isn't justified for this task. The verification logic is straightforward enough that a single agent with a well-defined loop can handle it effectively.
+
+4. **Specialization Not Required:** The verification task doesn't require distinct specialized knowledge bases or capabilities that would benefit from agent specialization. The same model can perform both initial answer generation and verification evaluation.
+
+The single-agent design avoids the **sequential bottleneck** structural failure that can occur in multi-agent systems when agents must wait for each other, and eliminates the **context saturation** that can occur when multiple agents each maintain their own context windows.
+
+### Evaluation Harness
+
+**Implementation:** The evaluation harness is implemented in `backend/tests/evaluation_harness.py` and was built from scratch without using existing evaluation frameworks.
+
+**Metrics Measured:**
+
+- **Task Completion Rate:** Percentage of test queries where the agent successfully completed the task (generated a meaningful answer with appropriate tools and verification when expected)
+- **Tool-Call Correctness:** Whether the agent selected appropriate tools and provided valid arguments for the given query
+- **Trajectory Length:** Number of iterations (tool-planning rounds + verification steps) each query required, measured to ensure the number is reasonable given query complexity
+- **Token Accounting:** Total tokens consumed per query are estimated and reported, allowing comparison of efficiency
+- **Failure Classification:** Unsuccessful cases are classified using the course taxonomy:
+  - **Hard Failure:** Complete failure to produce a useful response
+  - **Soft Failure:** Partial success with notable issues  
+  - **Cascading Soft Failure:** Multiple compounding soft failures
+
+**Test Coverage:** The harness includes 8 test cases covering various scenarios: simple queries that should/shouldn't trigger verification, multi-location comparisons, current events topics, and edge cases.
+
+### Additional Requirements
+
+**Skill vs. Agent Decision:** The verification capability was implemented as an agent rather than a Skill because it requires dynamic decision-making about whether to perform verification, execution of multiple sequential steps (evaluation → search → comparison → update), and the ability to run multiple iterations. A Skill would be insufficient because Skills are designed for static instruction sets, not for conditional logic with loops and state management.
+
+**Token and Cost Accounting:** The evaluation harness records total tokens consumed for each query using an estimation algorithm (≈4 characters per token for query, answer, tool overhead, and iteration overhead). Since this is a single-agent system, multi-agent baseline comparison is not applicable, but the token accounting makes the cost of the verification loop visible.
+
+**Failure Injection Test:** A comprehensive failure injection test suite is implemented in `backend/tests/failure_injection_test.py` that tests:
+- Tool unavailability (removing web_search during verification)
+- Malformed output (tool returning invalid JSON)
+- Timeouts (tool with artificial delay)
+
+The system recognizes tool unavailability and malformed output appropriately, but does not gracefully handle timeouts (as expected given the 10-second operation timeout). The agent provides appropriate error messages when tools are unavailable rather than producing confident answers based on incomplete information.
+
+**Tool vs. Agent Boundary:** The external weather API service is modeled as a bounded tool call rather than an agent-to-agent interaction. This design choice was made because the weather API is a simple request-response service that doesn't maintain state or require multi-step coordination. It takes a location query and returns current conditions - a single, bounded operation. Modeling it as a tool call keeps the architecture simpler and avoids the overhead of agent-to-agent communication protocols for what is essentially a function call. The weather service itself may be complex internally, but from our system's perspective, it's a bounded operation with clear inputs and outputs.
